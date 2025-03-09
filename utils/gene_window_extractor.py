@@ -6,7 +6,7 @@ import pandas as pd
 import pyfaidx
 import argparse
 
-def get_intergenic_sequences(df, fasta_file, source=None):
+def get_intergenic_sequences(df, fasta_file, source=None, max_window_length=178000):
     """Extracts intergenic sequences, grouped by chromosome."""
 
     if source:
@@ -15,25 +15,82 @@ def get_intergenic_sequences(df, fasta_file, source=None):
     fa = pyfaidx.Fasta(fasta_file)
     results = []
 
+    mrna_features = df[df['type'] == 'mRNA'].copy()
+
     for strand in ['+', '-']:
-        df_strand = df[df['strand'] == strand].sort_values('start')
+        df_strand = df[(df['strand'] == strand) & (df['type'] == 'gene')].sort_values('start')
 
         for chrom in df_strand['seqid'].unique():  # Iterate through unique chromosomes
             df_chrom_strand = df_strand[df_strand['seqid'] == chrom]
+            chrom_length = len(fa[chrom])
 
             for i in range(1, len(df_chrom_strand) - 1):
                 prev_gene = df_chrom_strand.iloc[i - 1]
                 current_gene = df_chrom_strand.iloc[i]
                 next_gene = df_chrom_strand.iloc[i + 1]
 
+                gene_id = current_gene['id']
+                gene_start = current_gene['start']
+                gene_end = current_gene['end']
+                gene_mrnas = mrna_features[mrna_features['parent_id'] == gene_id]
+
+                # Determine the TSS.
+                if not gene_mrnas.empty:
+                    if strand == '+':
+                        tss = gene_mrnas['start'].min()
+                    else:
+                        tss = gene_mrnas['end'].max()
+                else:
+                    # Fallback: use gene's own boundary.
+                    tss = gene_start if strand == '+' else gene_end
+
                 seq_start = prev_gene['end'] + 1
                 seq_end = next_gene['start'] - 1
 
                 if seq_start > seq_end:
+                    print(f"Warning: Start ({seq_start}) is greater than end ({seq_end}) for gene {gene_id}. Skipping.")
                     continue  # Skip if start is after end
 
+                half_window = max_window_length // 2
+                window_start = tss - half_window
+                window_end = window_start + max_window_length - 1
+
+                left_pad = 0
+                right_pad = 0
+
+                if window_start < seq_start:
+                    left_pad = seq_start - window_start
+
+                if window_end > seq_end:
+                    right_pad = window_end - seq_end
+
+                if window_start < 1:
+                    # The portion before position 1 => pad with 'N'.
+                    pad_amount = (1 - window_start)
+                    left_pad += pad_amount
+
+                if window_end > chrom_length:
+                    # The portion beyond the chromosome end => pad with 'N'.
+                    pad_amount = (window_end - chrom_length)
+                    right_pad += pad_amount
+
+                if window_start > window_end:
+                    print(f"Warning: Window start ({window_start}) is greater than window end ({window_end}) for gene {gene_id}. Skipping.")
+                    continue
+
                 try:
-                    seq = fa[chrom][seq_start - 1:seq_end].seq
+                    extract_start = max(window_start, 1)              # can't go below 1
+                    extract_end   = min(window_end, chrom_length)     # can't go above chrom_length
+                    
+                    if extract_start > extract_end:
+                        # nothing in-bounds, so the entire region is "N"
+                        print(f"Warning: No in-bounds region for gene {gene_id}. Skipping.")
+                        continue
+                    else:
+                        seq_fragment = fa[chrom][extract_start - 1 : extract_end].seq
+
+                    seq = ('N' * left_pad) + seq_fragment + ('N' * right_pad)
+                    assert len(seq) == max_window_length
                 except KeyError:
                     print(f"Warning: Chromosome {chrom} not found in FASTQ file. Skipping.")
                     continue
