@@ -6,8 +6,12 @@ import pandas as pd
 import pyfaidx
 import argparse
 
+
 def get_intergenic_sequences(df, fasta_file, source=None, max_window_length=178000):
-    """Extracts intergenic sequences, grouped by chromosome."""
+    """
+    Extract intergenic+gene windows with TSS centered. 
+    The region is defined by [prev_gene.end+1 .. next_gene.start-1] for each gene.
+    """
 
     if source:
         df = df[df['source'].isin(source)]
@@ -15,97 +19,100 @@ def get_intergenic_sequences(df, fasta_file, source=None, max_window_length=1780
     fa = pyfaidx.Fasta(fasta_file)
     results = []
 
-    mrna_features = df[df['type'] == 'mRNA'].copy()
+    # We'll keep only gene and mRNA features
+    gene_df = df[df['type'] == 'gene'].copy()
+    mrna_df = df[df['type'] == 'mRNA'].copy()
 
+    # Process both strands
     for strand in ['+', '-']:
-        df_strand = df[(df['strand'] == strand) & (df['type'] == 'gene')].sort_values('start')
+        # Filter to gene features on this strand, sorted by start
+        df_strand = gene_df[(gene_df['strand'] == strand)].sort_values('start')
 
-        for chrom in df_strand['seqid'].unique():  # Iterate through unique chromosomes
-            df_chrom_strand = df_strand[df_strand['seqid'] == chrom]
-            chrom_length = len(fa[chrom])
+        for chrom in df_strand['seqid'].unique():
+            # Genes on one chromosome
+            df_chrom = df_strand[df_strand['seqid'] == chrom]
 
-            for i in range(1, len(df_chrom_strand) - 1):
-                prev_gene = df_chrom_strand.iloc[i - 1]
-                current_gene = df_chrom_strand.iloc[i]
-                next_gene = df_chrom_strand.iloc[i + 1]
+            # Loop so that each gene has a previous and a next
+            for i in range(1, len(df_chrom) - 1):
+                prev_gene = df_chrom.iloc[i - 1]
+                current_gene = df_chrom.iloc[i]
+                next_gene = df_chrom.iloc[i + 1]
 
                 gene_id = current_gene['id']
                 gene_start = current_gene['start']
-                gene_end = current_gene['end']
-                gene_mrnas = mrna_features[mrna_features['parent_id'] == gene_id]
+                gene_end   = current_gene['end']
 
-                # Determine the TSS.
+                # Get mRNAs for this gene to determine TSS
+                gene_mrnas = mrna_df[mrna_df['parent_id'] == gene_id]
                 if not gene_mrnas.empty:
                     if strand == '+':
                         tss = gene_mrnas['start'].min()
                     else:
                         tss = gene_mrnas['end'].max()
                 else:
-                    # Fallback: use gene's own boundary.
+                    # Fallback
                     tss = gene_start if strand == '+' else gene_end
 
-                seq_start = prev_gene['end'] + 1
-                seq_end = next_gene['start'] - 1
+                # Intergenic region around this gene is [prev_gene.end+1 .. next_gene.start-1]
+                region_start = prev_gene['end'] + 1
+                region_end   = next_gene['start'] - 1
 
-                if seq_start > seq_end:
-                    print(f"Warning: Start ({seq_start}) is greater than end ({seq_end}) for gene {gene_id}. Skipping.")
-                    continue  # Skip if start is after end
+                # Just a safety check
+                if region_start > region_end:
+                    print(f"Warning: region_start ({region_start}) > region_end ({region_end}) for gene {gene_id}. Skipping.")
+                    continue
 
+                # 1) Compute the TSS-centered window of length max_window_length
                 half_window = max_window_length // 2
                 window_start = tss - half_window
-                window_end = window_start + max_window_length - 1
+                window_end   = window_start + max_window_length - 1  # inclusive
 
+                # 2) Figure out how much of that window is outside [region_start .. region_end].
+                #    Anything outside => 'N' padding.
                 left_pad = 0
                 right_pad = 0
 
-                if window_start < seq_start:
-                    left_pad = seq_start - window_start
+                # If window_start is left of region_start, that's how many bases we must pad on the left
+                if window_start < region_start:
+                    left_pad = region_start - window_start
 
-                if window_end > seq_end:
-                    right_pad = window_end - seq_end
+                # If window_end is right of region_end, pad on the right
+                if window_end > region_end:
+                    right_pad = window_end - region_end
 
-                if window_start < 1:
-                    # The portion before position 1 => pad with 'N'.
-                    pad_amount = (1 - window_start)
-                    left_pad += pad_amount
+                # 3) Extract the portion that actually falls within [region_start .. region_end].
+                extract_start = max(window_start, region_start)
+                extract_end   = min(window_end, region_end)
 
-                if window_end > chrom_length:
-                    # The portion beyond the chromosome end => pad with 'N'.
-                    pad_amount = (window_end - chrom_length)
-                    right_pad += pad_amount
-
-                if window_start > window_end:
-                    print(f"Warning: Window start ({window_start}) is greater than window end ({window_end}) for gene {gene_id}. Skipping.")
+                if extract_start > extract_end:
+                    print(f"Warning: No in-bounds region for gene {gene_id}. Skipping.")
                     continue
+                else:
+                    # Remember to subtract 1 if your GFF is 1-based and pyfaidx is 0-based
+                    seq_fragment = fa[chrom][extract_start - 1 : extract_end].seq
 
-                try:
-                    extract_start = max(window_start, 1)              # can't go below 1
-                    extract_end   = min(window_end, chrom_length)     # can't go above chrom_length
-                    
-                    if extract_start > extract_end:
-                        # nothing in-bounds, so the entire region is "N"
-                        print(f"Warning: No in-bounds region for gene {gene_id}. Skipping.")
-                        continue
-                    else:
-                        seq_fragment = fa[chrom][extract_start - 1 : extract_end].seq
+                # 4) Build the final window: left_pad of 'N', the in-bounds fragment, right_pad of 'N'
+                seq = ('N' * int(left_pad)) + seq_fragment + ('N' * int(right_pad))
 
-                    seq = ('N' * left_pad) + seq_fragment + ('N' * right_pad)
-                    assert len(seq) == max_window_length
-                except KeyError:
-                    print(f"Warning: Chromosome {chrom} not found in FASTQ file. Skipping.")
-                    continue
-                except IndexError:
-                    print(f"Warning: Indexing error for gene {current_gene['gene_name']} (start: {seq_start}, end: {seq_end}) on chromosome {chrom}. Check gene coordinates and FASTQ file.")
-                    continue
+                # 5) Check the length
+                assert len(seq) == max_window_length, (
+                    f"Expected {max_window_length} bases, got {len(seq)}. "
+                    f"(tss={tss}, region=[{region_start},{region_end}], "
+                    f"window=[{window_start},{window_end}])"
+                )
 
                 results.append({
                     'name': current_gene['name'],
                     'chrom': chrom,
-                    'gene_start': current_gene['start'],
-                    'gene_stop': current_gene['end'],
-                    'seq_start': seq_start,
-                    'seq_stop': seq_end,
                     'strand': strand,
+                    'gene_start': gene_start,
+                    'gene_end': gene_end,
+                    'region_start': region_start,
+                    'region_end': region_end,
+                    'tss': tss,
+                    'window_start': window_start,
+                    'window_end': window_end,
+                    'seq_length': len(seq),
                     'seq': seq,
                     'source': current_gene['source']
                 })
